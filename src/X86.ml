@@ -93,7 +93,180 @@ open SM
    Take an environment, a stack machine program, and returns a pair --- the updated environment and the list
    of x86 instructions
 *)
-let compile env code = failwith "Not implemented"
+let compile env code =
+  let suffix = function
+  | "<"  -> "l"
+  | "<=" -> "le"
+  | "==" -> "e"
+  | "!=" -> "ne"
+  | ">=" -> "ge"
+  | ">"  -> "g"
+  | _    -> failwith "unknown operator"
+  in
+  let mov x y =  
+    match x, y with
+    | R _ , _ | _, R _ -> [Mov (x, y)]
+    | _, _ -> [Mov (x, eax); Mov (eax, y)]
+  in
+  let binop op x y = 
+    match x, y with
+    | R _ , _ | _, R _ -> [Binop (op, y, x)]
+    | _, _ -> [Mov (x, eax); Binop (op, y, eax); Mov (eax, x)]
+  in
+  let hash_tag tag = 
+    let length = String.length tag in
+    let sub = 
+      if length < 5 
+      then String.sub tag 0 length
+      else String.sub tag 0 5
+    in
+    let char_code ch = 
+      match ch with
+    | '_' -> 53
+    | ch when ch <= 'Z' -> Char.code ch - 64
+    | ch -> Char.code ch - 70
+  in
+    let rec hash h i = 
+      if i >= length 
+      then h
+      else hash ( (h lsl 6) lor (char_code sub.[i])) (i + 1)
+    in
+    hash 0 0
+  in
+  let rec compile' env scode =
+    let on_stack = function S _ -> true | _ -> false in
+    let call env f n p =
+      let f =
+        match f.[0] with '.' -> "B" ^ String.sub f 1 (String.length f - 1) | _ -> f
+      in
+      let pushr, popr =
+        List.split @@ List.map (fun r -> (Push r, Pop r)) (env#live_registers n)
+      in
+      let env, code =
+        if n = 0
+        then env, pushr @ [Call f] @ (List.rev popr)
+        else
+          let rec push_args env acc = function
+            | 0 -> env, acc
+            | n -> let x, env = env#pop in
+              push_args env ((Push x)::acc) (n-1)
+          in
+          let env, pushs = push_args env [] n in
+          let pushs =
+            match f with
+            | "Belem" -> List.rev pushs
+            | "Barray" | "Bsexp" -> List.rev @@ (Push (L n)) :: pushs
+            | "Bsta"     ->
+              let x::v::is = List.rev pushs in
+              is @ [x; v] @ [Push (L (n-2))]
+            | _  -> pushs
+          in
+          env, pushr @ pushs @ [Call f; Binop ("+", L (n*4), esp)] @ (List.rev popr)
+      in
+      (if p then env, code else let y, env = env#allocate in env, code @ [Mov (eax, y)])
+    in
+    match scode with
+    | [] -> env, []
+    | instr :: scode' ->
+      let env', code' =
+        match instr with
+      | CONST n ->
+          let s, env = env#allocate in
+          env, [ Mov (L n, s)]
+      | STRING s ->
+          let s, env = env#string s in
+          let l, env = env#allocate in
+          let env, call = call env ".string" 1 false in
+          env, Mov (M ("$" ^ s), l) :: call  
+      | SEXP (tag, n) -> 
+          let env, code = call env ".sexp" (n + 1) false in
+          env, [Push (L (hash_tag tag))] @ code
+      | LD x -> 
+        let s, env = (env#global x)#allocate in
+        env, mov (env#loc x) s  
+      | ST x ->
+          let s, env = (env#global x)#pop in
+          env, mov s (env#loc x)
+      | STA (x, n) ->
+          let s, env = (env#global x)#allocate in
+          let push = mov (env#loc x) s in
+          let env, code = call env ".sta" (n + 2) true in
+          env, push @ code
+      | LABEL label -> 
+          if env#is_barrier 
+          then (env#drop_barrier)#retrieve_stack label, [Label label]
+          else env, [Label label]
+      | JMP label -> 
+          (env#set_stack label)#set_barrier, [Jmp label]
+      | CJMP (suf, label) -> 
+          let s, env = env#pop in
+          env#set_stack label, [Mov (s, eax); Binop ("cmp", L 0, eax); CJmp (suf, label)]  
+      | BEGIN (name, args, locals) ->
+          let env = env#enter name args locals in
+          env, [Push ebp; Mov (esp, ebp); Binop ("-", M ("$" ^ env#lsize), esp)]  
+      | END -> 
+          env, 
+          [ Label env#epilogue; 
+             Mov (ebp, esp); 
+             Pop ebp; 
+             Ret; 
+             Meta (Printf.sprintf "\t.set %s, %d" env#lsize (env#allocated * word_size))]
+      | CALL (name, n, p) -> call env name n p
+      | DROP -> 
+          let s, env = env#pop in
+          env, []
+      | DUP ->
+          let h = env#peek in
+          let s, env = env#allocate in
+          env, mov h s
+      | SWAP ->
+          let x, y = env#peek2 in
+          env, [Push x; Push y; Pop x; Pop y] 
+      | TAG tag ->
+          let s, env = env#allocate in
+          let env, code = call env ".tag" 2 false in
+          env, [Mov (L (hash_tag tag), s)] @ code
+      | ENTER vs -> 
+          let env, code = 
+            List.fold_left 
+              (
+                fun (env, code) v ->
+                  let s, env = env#pop in
+                  env, (mov s (env#loc v)):: code
+              )
+              (env#scope (List.rev vs) , [])
+              vs in
+          env, List.flatten (List.rev code)
+      | LEAVE -> 
+          env#unscope, []
+      | RET b ->
+          if b 
+          then let x, env = env#pop in env, [Mov (x, eax); Jmp env#epilogue]
+          else env, [Jmp env#epilogue]
+      | BINOP op -> (
+          let right, left, env = env#pop2 in
+          let result, env = env#allocate in
+          match op with
+          | "+" | "-" | "*" -> 
+            env, (binop op left right) @ mov left result
+          | "/" ->
+            env, [Mov (left, eax); Cltd; IDiv right; Mov (eax, result)]
+          | "%" ->
+            env, [Mov (left, eax); Cltd; IDiv right; Mov (edx, result)]
+          | "&&" | "!!" ->
+            env, [  Binop ("^", eax, eax); Binop ("^", edx, edx);
+                Binop ("cmp", L 0, left); Set ("nz", "%al"); 
+                Binop ("cmp", L 0, right); Set ("nz", "%dl"); 
+                Binop (op, eax, edx); Mov (edx, result)]
+          | "<" | ">" | "<=" | ">=" | "==" | "!=" ->
+            env, [Mov (left, eax); Binop ("^", edx, edx); Binop ("cmp", right, eax); Set (suffix op, "%dl"); Mov (edx, result)]
+          | _ -> failwith("Unknown operatorion: " ^ op)
+        )
+      in
+      let env'', code'' = compile' env' scode' in
+      env'', code' @ code''
+  in
+  compile' env code
 
 (* A set of strings *)           
 module S = Set.Make (String) 
@@ -104,7 +277,11 @@ module M = Map.Make (String)
 (* Environment implementation *)
 class env =
   let chars          = "_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNJPQRSTUVWXYZ" in
-  let make_assoc l i = List.combine l (List.init (List.length l) (fun x -> x + i)) in
+  let rec sequence i n f =
+    if i < n then (f i) :: (sequence (i + 1) n f)
+    else [] 
+  in
+  let make_assoc l i = List.combine l (sequence 0 (List.length l) (fun x -> x + i)) in
   let rec assoc  x   = function [] -> raise Not_found | l :: ls -> try List.assoc x l with Not_found -> assoc x ls in
   object (self)
     val globals     = S.empty (* a set of global variables         *)
